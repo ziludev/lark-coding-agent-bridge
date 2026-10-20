@@ -61,7 +61,7 @@ describe('renderers strip emails end-to-end', () => {
     { type: 'text', delta: 'Committed. Trailer: authored by team@example.org.' },
     { type: 'done', terminationReason: 'normal' },
   ];
-  const state: RunState = withEmail.reduce(reduce, initialState);
+  const state: RunState = withEmail.reduce((acc, evt) => reduce(acc, evt), initialState);
   const rawEmail = /[A-Za-z0-9._%+-]+@(?:[A-Za-z0-9-]+\.)+[A-Za-z]{2,}/;
 
   it('renderText emits no raw email', () => {

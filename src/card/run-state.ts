@@ -27,6 +27,12 @@ export interface RunState {
   /** Set when terminal === 'idle_timeout' — how long claude was idle before
    * the watchdog gave up (so the message can say "N 分钟无响应"). */
   idleTimeoutMinutes?: number;
+  /** Tool calls seen in this run, so a long tool loop shows visible progress.
+   * Optional so externally-built RunState literals stay valid. */
+  toolCalls?: number;
+  /** Epoch ms the in-flight tool started. Absent when no tool runs, or when the
+   * caller supplied no clock (keeps `reduce` deterministic for tests). */
+  activeToolStartedAt?: number;
 }
 
 export const initialState: RunState = {
@@ -34,7 +40,13 @@ export const initialState: RunState = {
   reasoning: { content: '', active: false },
   footer: 'thinking',
   terminal: 'running',
+  toolCalls: 0,
 };
+
+export interface ReduceOptions {
+  /** Wall clock used for the elapsed-time label; omitted by pure callers/tests. */
+  now?: number;
+}
 
 function closeStreamingText(blocks: Block[]): Block[] {
   return blocks.map((b) =>
@@ -42,7 +54,7 @@ function closeStreamingText(blocks: Block[]): Block[] {
   );
 }
 
-export function reduce(state: RunState, evt: AgentEvent): RunState {
+export function reduce(state: RunState, evt: AgentEvent, opts: ReduceOptions = {}): RunState {
   switch (evt.type) {
     case 'text': {
       const last = state.blocks[state.blocks.length - 1];
@@ -86,6 +98,8 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
         blocks: [...closeStreamingText(state.blocks), { kind: 'tool', tool }],
         reasoning: { ...state.reasoning, active: false },
         footer: 'tool_running',
+        toolCalls: (state.toolCalls ?? 0) + 1,
+        ...(opts.now !== undefined ? { activeToolStartedAt: opts.now } : {}),
       };
     }
 
@@ -101,7 +115,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
           },
         };
       });
-      return { ...state, blocks };
+      return { ...state, blocks, activeToolStartedAt: undefined };
     }
 
     case 'error': {
@@ -116,6 +130,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
         terminal,
         errorMsg: terminal === 'error' ? evt.message : state.errorMsg,
         footer: null,
+        activeToolStartedAt: undefined,
       };
     }
 
@@ -132,6 +147,7 @@ export function reduce(state: RunState, evt: AgentEvent): RunState {
         reasoning: { ...state.reasoning, active: false },
         terminal,
         footer: null,
+        activeToolStartedAt: undefined,
       };
     }
 
@@ -147,6 +163,7 @@ export function markInterrupted(state: RunState): RunState {
     reasoning: { ...state.reasoning, active: false },
     terminal: 'interrupted',
     footer: null,
+    activeToolStartedAt: undefined,
   };
 }
 
@@ -158,6 +175,7 @@ export function markIdleTimeout(state: RunState, minutes: number): RunState {
     terminal: 'idle_timeout',
     footer: null,
     idleTimeoutMinutes: minutes,
+    activeToolStartedAt: undefined,
   };
 }
 
@@ -169,5 +187,6 @@ export function finalizeIfRunning(state: RunState): RunState {
     reasoning: { ...state.reasoning, active: false },
     terminal: 'done',
     footer: null,
+    activeToolStartedAt: undefined,
   };
 }

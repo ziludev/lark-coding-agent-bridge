@@ -1,5 +1,6 @@
 import { deepMaskEmails } from './mask-email';
-import type { Block, FooterStatus, RunState, ToolEntry } from './run-state';
+import { toolProgressSuffix } from './progress-label';
+import type { Block, RunState, ToolEntry } from './run-state';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
 const REASONING_MAX = 1500;
@@ -48,7 +49,7 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   }
 
   if (state.terminal === 'running') {
-    if (state.footer) elements.push(footerStatus(state.footer));
+    if (state.footer) elements.push(footerStatus(state));
     elements.push(stopButton(options));
   }
 
@@ -194,12 +195,12 @@ function stopButton(options: RunCardRenderOptions): object {
   };
 }
 
-function footerStatus(status: Exclude<FooterStatus, null>): object {
+function footerStatus(state: RunState): object {
   const text =
-    status === 'thinking'
+    state.footer === 'thinking'
       ? '🧠 正在思考'
-      : status === 'tool_running'
-        ? '🧰 正在调用工具'
+      : state.footer === 'tool_running'
+        ? `🧰 正在调用工具${toolProgressSuffix(state)}`
         : '✍️ 正在输出';
   return noteMd(text);
 }

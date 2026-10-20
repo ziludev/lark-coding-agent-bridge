@@ -1231,7 +1231,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
                 }
                 if (evt.type === 'text') echoText += evt.delta;
                 if (evt.type === 'final_text') echoText = evt.content;
-                state = reduce(state, evt);
+                state = reduce(state, evt, { now: Date.now() });
                 await flush();
                 // Don't wait for stdout to close — some claude versions hang
                 // briefly post-result, which would leave the for-await stuck.
@@ -1258,7 +1258,7 @@ async function handleDoctor(args: string, ctx: CommandContext): Promise<void> {
         }
         if (evt.type === 'text') echoText += evt.delta;
         if (evt.type === 'final_text') echoText = evt.content;
-        state = reduce(state, evt);
+        state = reduce(state, evt, { now: Date.now() });
         if (state.terminal !== 'running') break;
       }
       state = execution.handle.interrupted ? markInterrupted(state) : finalizeIfRunning(state);

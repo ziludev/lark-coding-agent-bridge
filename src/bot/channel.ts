@@ -78,6 +78,12 @@ import {
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
 const REACTION_CLEANUP_GRACE_MS = 1000;
+/**
+ * How often a running card re-renders while a tool is in flight, so the
+ * footer's elapsed counter keeps moving during long one-shot tools (SLS
+ * queries, big builds). Slower than this and the timer looks stuck again.
+ */
+const TOOL_TICKER_MS = 5000;
 
 const BRIDGE_AGENT_INSTRUCTIONS = [
   '你在 bridge 进程中运行，普通 lark-cli 会继承 LARK_CHANNEL=1 并进入 bridge-bound 模式。',
@@ -1588,6 +1594,39 @@ async function processAgentStream(
   };
   armOrPauseIdle();
 
+  // A long tool call emits nothing until it returns, so the card would sit on a
+  // bare "正在调用工具" for minutes — indistinguishable from a hung run. While a
+  // tool is in flight, re-render on a timer so the footer's 第 N 次 / 已 Xs keeps
+  // moving. Flushes are serialized with the event-driven ones so a tick can
+  // never interleave with (or reorder) a render.
+  let flushChain: Promise<void> = Promise.resolve();
+  const flushSerialized = (next: RunState): Promise<void> => {
+    const run = flushChain.then(
+      () => flush(next),
+      () => flush(next),
+    );
+    // Keep the chain usable after a failed render; the caller still sees it.
+    flushChain = run.catch(() => undefined);
+    return run;
+  };
+  let toolTicker: NodeJS.Timeout | undefined;
+  const syncToolTicker = (): void => {
+    if (inFlightTools.size > 0) {
+      if (toolTicker) return;
+      toolTicker = setInterval(() => {
+        if (state.terminal !== 'running') return;
+        void flushSerialized(state).catch((err) => {
+          log.fail('stream', err, { step: 'tool-ticker-flush' });
+        });
+      }, TOOL_TICKER_MS);
+      return;
+    }
+    if (toolTicker) {
+      clearInterval(toolTicker);
+      toolTicker = undefined;
+    }
+  };
+
   try {
     for await (const evt of events) {
       if (handle.interrupted) break;
@@ -1606,6 +1645,7 @@ async function processAgentStream(
         log.info('agent', 'tool-done', { inFlight: inFlightTools.size });
       }
       armOrPauseIdle();
+      syncToolTicker();
 
       if (evt.type === 'system') {
         recordSession(evt);
@@ -1628,11 +1668,11 @@ async function processAgentStream(
 
       const prevTerminal = state.terminal;
       const prevFooter = state.footer;
-      state = reduce(state, evt);
+      state = reduce(state, evt, { now: Date.now() });
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
-      await flush(state);
+      await flushSerialized(state);
       // Stop iterating as soon as we have a terminal state. Some claude
       // versions don't close stdout immediately after the result event, which
       // would leave the for-await waiting forever otherwise.
@@ -1640,6 +1680,7 @@ async function processAgentStream(
     }
   } finally {
     if (timer) clearTimeout(timer);
+    if (toolTicker) clearInterval(toolTicker);
   }
 
   // If state already reached a terminal event (done/error/etc.) before the
@@ -1657,7 +1698,9 @@ async function processAgentStream(
   }
   log.info('card', 'final', { scope, terminal: state.terminal, interrupted: handle.interrupted });
   reportMetric('run_e2e_ms', Date.now() - runStart, { terminal: state.terminal });
-  await flush(state);
+  // Serialized with the ticker so a tick that was already in flight can never
+  // repaint a stale running frame over the terminal one.
+  await flushSerialized(state);
   if (handle.interrupted) {
     await handle.run.stop();
   }

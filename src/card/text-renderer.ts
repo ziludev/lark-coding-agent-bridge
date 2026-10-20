@@ -1,4 +1,5 @@
 import { maskEmails } from './mask-email';
+import { toolProgressSuffix } from './progress-label';
 import type { Block, RunState, ToolEntry } from './run-state';
 import { toolHeaderText } from './tool-render';
 
@@ -28,7 +29,7 @@ export function renderText(state: RunState): string {
   } else if (state.terminal === 'error' && state.errorMsg) {
     parts.push(`⚠️ agent 失败:${state.errorMsg}`);
   } else if (state.terminal === 'running' && state.footer) {
-    parts.push(footerLine(state.footer));
+    parts.push(footerLine(state));
   }
 
   // Strip raw emails so the Feishu tenant audit doesn't reject the message
@@ -54,8 +55,10 @@ function toolLine(tool: ToolEntry): string {
   return `> ${toolHeaderText(tool)}`;
 }
 
-function footerLine(status: 'thinking' | 'tool_running' | 'streaming'): string {
-  if (status === 'thinking') return '_🧠 正在思考…_';
-  if (status === 'tool_running') return '_🧰 正在调用工具…_';
+function footerLine(state: RunState): string {
+  if (state.footer === 'thinking') return '_🧠 正在思考…_';
+  if (state.footer === 'tool_running') {
+    return `_🧰 正在调用工具…${toolProgressSuffix(state)}_`;
+  }
   return '_✍️ 正在输出…_';
 }
