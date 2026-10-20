@@ -13,11 +13,19 @@ import { writeFileAtomic } from '../platform/atomic-write';
  *   ~/.lark-channel/.keystore.salt   — 32 random bytes, generated once
  *
  * Both files are chmod 0600. The encryption key is derived (PBKDF2-SHA256,
- * 100k iters) from `hostname + userInfo().username + salt`. This is
- * **defense-in-depth against accidental disclosure** (backups, git commits,
- * log dumps) — *not* against a same-user process actively decrypting. That
- * threat needs a real OS keychain, which is out of scope for this bridge
- * given lark-cli already terminates secrets in its own keychain on bind.
+ * 100k iters) from `userInfo().username + salt`. This is **defense-in-depth
+ * against accidental disclosure** (backups, git commits, log dumps) — *not*
+ * against a same-user process actively decrypting. That threat needs a real
+ * OS keychain, which is out of scope for this bridge given lark-cli already
+ * terminates secrets in its own keychain on bind.
+ *
+ * The key must NOT depend on the hostname: macOS appends a numeric suffix when
+ * a Bonjour name collides on the network (`Alexs-MacBook-Air.local` becomes
+ * `Alexs-MacBook-Air-3.local`), and a rename silently makes every stored secret
+ * undecryptable — the daemon then crash-loops on
+ * "Unsupported state or unable to authenticate data". The name is still tried
+ * as a legacy seed so keystores written before this change keep working, and a
+ * successful legacy read is re-encrypted under the current key.
  */
 
 const KEY_LEN = 32;
@@ -83,15 +91,40 @@ async function loadOrCreateSalt(storePaths: KeystorePaths = paths): Promise<Buff
   return salt;
 }
 
+/**
+ * Seeds for the PBKDF2 key, most-current first. `current` is hostname-free and
+ * therefore stable across machine renames; `legacy` reproduces the original
+ * scheme so old keystores stay readable.
+ */
+function keySeeds(): string {
+  return userInfo().username;
+}
+
+function legacyKeySeeds(): string[] {
+  return [`${hostname()}|${userInfo().username}`];
+}
+
+function deriveKeyFromSeed(seed: string, salt: Buffer): Buffer {
+  return pbkdf2Sync(seed, salt, PBKDF2_ITER, KEY_LEN, 'sha256');
+}
+
 async function deriveKey(storePaths: KeystorePaths = paths): Promise<Buffer> {
   const cacheKey = `${storePaths.keystoreSaltFile}`;
   const cached = derivedKeyCache.get(cacheKey);
   if (cached) return cached;
   const salt = await loadOrCreateSalt(storePaths);
-  const seed = `${hostname()}|${userInfo().username}`;
-  const key = pbkdf2Sync(seed, salt, PBKDF2_ITER, KEY_LEN, 'sha256');
+  const key = deriveKeyFromSeed(keySeeds(), salt);
   derivedKeyCache.set(cacheKey, key);
   return key;
+}
+
+function logKeystoreMigration(id: string): void {
+  // stderr, not the structured logger: the keystore is also used by the
+  // `secrets` CLI before logging is configured.
+  console.error(
+    `[keystore] re-encrypted "${id}" under the hostname-free key; ` +
+      'the stored secret survives future machine renames.',
+  );
 }
 
 function encrypt(key: Buffer, plaintext: string): Envelope {
@@ -129,7 +162,31 @@ export async function getSecret(
   const env = store.entries[id];
   if (!env) return undefined;
   const key = await deriveKey(storePaths);
-  return decrypt(key, env);
+  let failure: unknown;
+  try {
+    return decrypt(key, env);
+  } catch (err) {
+    failure = err;
+  }
+
+  // Entry predates the hostname-free key (or the machine was renamed): try the
+  // legacy seed, and on success re-encrypt so this only costs once.
+  const salt = await loadOrCreateSalt(storePaths);
+  for (const seed of legacyKeySeeds()) {
+    let plaintext: string;
+    try {
+      plaintext = decrypt(deriveKeyFromSeed(seed, salt), env);
+    } catch {
+      continue;
+    }
+    await writeStore(
+      { ...store, entries: { ...store.entries, [id]: encrypt(key, plaintext) } },
+      storePaths,
+    );
+    logKeystoreMigration(id);
+    return plaintext;
+  }
+  throw failure;
 }
 
 /** Store / overwrite the secret for `id`. */
