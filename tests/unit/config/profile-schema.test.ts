@@ -96,6 +96,43 @@ describe('profile schema', () => {
     ).toThrow(/codex/i);
   });
 
+  it('requires pi configuration when agentKind is pi', () => {
+    expect(() =>
+      normalizeProfileConfig({
+        schemaVersion: 2,
+        agentKind: 'pi',
+        accounts: { app },
+      }),
+    ).toThrow(/pi profile requires pi/i);
+  });
+
+  it('defaults a pi profile to inheriting the operator agent dir', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'pi',
+      accounts: { app },
+      pi: { binaryPath: '/usr/local/bin/pi' },
+    });
+
+    expect(cfg.agentKind).toBe('pi');
+    expect(cfg.pi).toEqual({ binaryPath: '/usr/local/bin/pi', inheritAgentDir: true });
+  });
+
+  it('keeps an explicit isolated pi agent dir', () => {
+    const cfg = normalizeProfileConfig({
+      schemaVersion: 2,
+      agentKind: 'pi',
+      accounts: { app },
+      pi: { binaryPath: '/usr/local/bin/pi', agentDir: '/state/pi-agent', inheritAgentDir: false },
+    });
+
+    expect(cfg.pi).toEqual({
+      binaryPath: '/usr/local/bin/pi',
+      agentDir: '/state/pi-agent',
+      inheritAgentDir: false,
+    });
+  });
+
   it('rejects sandbox defaults that exceed max capability as a permission error', () => {
     expect(() =>
       normalizeProfileConfig({

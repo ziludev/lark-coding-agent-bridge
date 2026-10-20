@@ -2,13 +2,13 @@ import { randomUUID } from 'node:crypto';
 import { mkdir } from 'node:fs/promises';
 import { dirname } from 'node:path';
 import type { CommentEvent, LarkChannel } from '@larksuite/channel';
-import { claudeCapability, codexCapability } from '../agent/capability';
+import { agentCapability, usesNativeSessionId } from '../agent/capability';
 import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { getAgentStopGraceMs } from '../config/schema';
 import type { Controls } from '../commands';
 import { resolveAppPaths } from '../config/app-paths';
 import { log } from '../core/logger';
-import { evaluateRunPolicy } from '../policy/run-policy';
+import { agentHomeFields, evaluateRunPolicy } from '../policy/run-policy';
 import { resolveWorkingDirectory } from '../policy/workspace';
 import { RunRejected } from '../runtime/errors';
 import type { ActiveRuns } from './active-runs';
@@ -186,10 +186,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
     : false;
 
   try {
-    const capability =
-      controls.profileConfig.agentKind === 'codex'
-        ? codexCapability(controls.profileConfig)
-        : claudeCapability(controls.profileConfig);
+    const capability = agentCapability(controls.profileConfig);
     const runTimeoutMs = commentRunTimeoutMs(sessions, runScopeId);
     const threadTimeoutMs = commentRunTimeoutMs(sessions, commentThreadScopeId);
     const commentTimeoutMs = runTimeoutMs !== undefined ? runTimeoutMs : threadTimeoutMs;
@@ -211,8 +208,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
       capability,
       profileConfig: controls.profileConfig,
       now: Date.now(),
-      codexHome: controls.profileConfig.codex?.codexHome,
-      inheritCodexHome: controls.profileConfig.codex?.inheritCodexHome,
+      ...agentHomeFields(controls.profileConfig),
       ...(typeof commentTimeoutMs === 'number' ? { ttlMs: commentTimeoutMs } : {}),
     });
     if (!policy.ok) {
@@ -243,7 +239,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
           })
         : undefined;
       const sessionId =
-        canResumeAgentSession && capability.agentId === 'claude'
+        canResumeAgentSession && usesNativeSessionId(capability)
           ? sessions.resumeFor(docSessionScopeId, cwdRealpath) ??
             sessions.resumeFor(legacyDocSessionScopeId, cwdRealpath)
           : undefined;
@@ -328,7 +324,7 @@ export async function handleCommentMention(deps: CommentDeps): Promise<void> {
             policy,
             event: e,
           });
-          if (capability.agentId === 'claude' && e.type === 'system' && e.sessionId) {
+          if (usesNativeSessionId(capability) && e.type === 'system' && e.sessionId) {
             sessions.set(docSessionScopeId, e.sessionId, policy.cwdRealpath);
           }
           switch (e.type) {

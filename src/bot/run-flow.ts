@@ -1,9 +1,10 @@
-import type { AgentCapability } from '../agent/capability';
+import { usesNativeSessionId, type AgentCapability } from '../agent/capability';
 import { resolveModelArg } from '../agent/models';
 import type { AgentEvent } from '../agent/types';
 import type { ProfileConfig } from '../config/profile-schema';
 import type { AccessDecision } from '../policy/access';
 import {
+  agentHomeFields,
   evaluateRunPolicy,
   type AgentAttachment,
   type RunPolicyAllow,
@@ -99,8 +100,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
     capability: input.capability,
     profileConfig: input.profileConfig,
     now: input.now,
-    codexHome: input.profileConfig.codex?.codexHome,
-    inheritCodexHome: input.profileConfig.codex?.inheritCodexHome,
+    ...agentHomeFields(input.profileConfig),
   });
   if (!policy.ok) {
     return {
@@ -120,15 +120,15 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
       cwdRealpath: workspace.cwdRealpath,
       policyFingerprint: policy.policyFingerprint,
     });
-    if (catalogEntry?.agentId === 'claude') {
-      sessionId = catalogEntry.sessionId;
-      resumeFrom = sessionId;
-    } else if (catalogEntry?.agentId === 'codex') {
+    if (catalogEntry?.agentId === 'codex') {
       threadId = catalogEntry.threadId;
       resumeFrom = threadId;
+    } else if (catalogEntry?.sessionId) {
+      sessionId = catalogEntry.sessionId;
+      resumeFrom = sessionId;
     }
   }
-  if (!resumeFrom && input.capability.agentId === 'claude') {
+  if (!resumeFrom && usesNativeSessionId(input.capability)) {
     resumeFrom = input.sessions.resumeFor(input.scopeId, workspace.cwdRealpath);
     sessionId = resumeFrom;
     const stale = input.sessions.getRaw(input.scopeId);
@@ -149,7 +149,7 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
         input.profileConfig.preferences.model,
       ),
       images:
-        input.capability.agentId === 'codex'
+        input.capability.agentId === 'codex' || input.capability.agentId === 'pi'
           ? policy.attachments
               .filter((attachment) => attachment.kind === 'image' && attachment.decision === 'accepted')
               .map((attachment) => attachment.path)
@@ -188,12 +188,12 @@ export async function startRunFlow(input: StartRunFlowInput): Promise<StartRunFl
 
 export function recordRunSessionEvent(input: RecordRunSessionEventInput): void {
   if (input.event.type !== 'system') return;
-  if (input.capability.agentId === 'claude' && input.event.sessionId) {
+  if (usesNativeSessionId(input.capability) && input.event.sessionId) {
     const cwdRealpath = input.event.cwd ?? input.policy.cwdRealpath;
     input.sessions.set(input.scopeId, input.event.sessionId, cwdRealpath);
     input.sessionCatalog?.upsertActive({
       scopeId: input.scopeId,
-      agentId: 'claude',
+      agentId: input.capability.agentId,
       cwdRealpath,
       policyFingerprint: input.policy.policyFingerprint,
       sessionId: input.event.sessionId,

@@ -5,6 +5,7 @@ import { runRegistrationWizard } from '../bot/wizard';
 import { detectInstalledAgents, type DetectedAgent } from '../cli/agent-detection';
 import {
   createBootstrapCodexConfig,
+  createBootstrapPiConfig,
   createBootstrapProfileConfig,
   resolveBootstrapWorkspace,
 } from '../cli/profile-bootstrap';
@@ -90,6 +91,16 @@ export function createRuntimeProfileConfig(
     ...(input.agentKind === 'codex'
       ? { codex: input.codex ?? { binaryPath: process.env.LARK_CHANNEL_CODEX_BIN ?? 'codex' } }
       : {}),
+    ...(input.agentKind === 'pi'
+      ? {
+          pi:
+            input.pi ??
+            ({
+              binaryPath: process.env.LARK_CHANNEL_PI_BIN ?? 'pi',
+              inheritAgentDir: true,
+            } as const),
+        }
+      : {}),
   });
 }
 
@@ -108,7 +119,7 @@ export async function resolveProfileRuntime(
   if (!profile && opts.allowBootstrap) {
     const detected = await detectInstalledAgents();
     if (detected.length === 0) {
-      throw new Error('no supported local agent found; install claude or codex first');
+      throw new Error('no supported local agent found; install claude, codex or pi first');
     }
     if (detected.length > 1) {
       const selected = await selectDetectedAgent(detected, opts.selectAgent);
@@ -137,6 +148,9 @@ export async function resolveProfileRuntime(
     ...(migrationAgent ? { agentKind: migrationAgent } : {}),
     ...(needsMigration && migrationAgent === 'codex'
       ? { codex: await createBootstrapCodexConfig(undefined) }
+      : {}),
+    ...(needsMigration && migrationAgent === 'pi'
+      ? { pi: await createBootstrapPiConfig(undefined) }
       : {}),
   }, opts.handleActiveBridgeMigrationConflict);
 
@@ -395,7 +409,9 @@ function resolveBootstrapAgent(
   requestedAgent: AgentKind | undefined,
   profile: string | undefined,
 ): AgentKind | undefined {
-  return requestedAgent ?? (profile === 'codex' ? 'codex' : undefined);
+  if (requestedAgent) return requestedAgent;
+  if (profile === 'codex' || profile === 'pi') return profile;
+  return undefined;
 }
 
 async function hasLegacyConfig(configPath: string): Promise<boolean> {
@@ -613,7 +629,9 @@ class UserCancelledError extends Error {
 }
 
 function displayAgentKind(kind: AgentKind): string {
-  return kind === 'claude' ? 'Claude Code' : 'Codex CLI';
+  if (kind === 'codex') return 'Codex CLI';
+  if (kind === 'pi') return 'Pi';
+  return 'Claude Code';
 }
 
 async function maybeMigrateRootPlaintextSecret(

@@ -14,6 +14,7 @@ export interface BootstrapProfileInput {
   workspace?: string;
   defaultWorkspace?: string;
   codexBinaryPath?: string;
+  piBinaryPath?: string;
   profileDir?: string;
 }
 
@@ -29,12 +30,15 @@ export async function createBootstrapProfileConfig(
     input.agentKind === 'codex'
       ? await createBootstrapCodexConfig(input.codexBinaryPath)
       : undefined;
+  const pi =
+    input.agentKind === 'pi' ? await createBootstrapPiConfig(input.piBinaryPath) : undefined;
   const profile = createDefaultProfileConfig({
     agentKind: input.agentKind,
     accounts: input.accounts,
     preferences: input.preferences,
     secrets: input.secrets,
     ...(codex ? { codex } : {}),
+    ...(pi ? { pi } : {}),
   });
   if (workspace) {
     profile.workspaces = {
@@ -44,6 +48,9 @@ export async function createBootstrapProfileConfig(
   }
   if (input.profileDir && profile.codex?.inheritCodexHome === false) {
     await mkdir(join(input.profileDir, 'codex-home'), { recursive: true });
+  }
+  if (input.profileDir && profile.pi?.inheritAgentDir === false) {
+    await mkdir(join(input.profileDir, 'pi-agent'), { recursive: true, mode: 0o700 });
   }
   return profile;
 }
@@ -67,7 +74,7 @@ export async function createBootstrapCodexConfig(binaryPath: string | undefined)
   } catch (err) {
     const errno = (err as NodeJS.ErrnoException).code;
     throw new AgentPreflightError({
-      code: codexBootstrapBinaryErrorCode(errno),
+      code: bootstrapBinaryErrorCode(errno),
       agentId: 'codex',
       agentName: 'Codex CLI',
       command,
@@ -78,7 +85,26 @@ export async function createBootstrapCodexConfig(binaryPath: string | undefined)
   return { binaryPath: resolvedBinary };
 }
 
-function codexBootstrapBinaryErrorCode(errno: string | undefined) {
+export async function createBootstrapPiConfig(binaryPath: string | undefined) {
+  const command = binaryPath ?? process.env.LARK_CHANNEL_PI_BIN ?? 'pi';
+  let resolvedBinary: string;
+  try {
+    resolvedBinary = await resolveExecutablePath(command);
+  } catch (err) {
+    const errno = (err as NodeJS.ErrnoException).code;
+    throw new AgentPreflightError({
+      code: bootstrapBinaryErrorCode(errno),
+      agentId: 'pi',
+      agentName: 'Pi',
+      command,
+      binaryPath: command,
+      errno,
+    });
+  }
+  return { binaryPath: resolvedBinary, inheritAgentDir: true };
+}
+
+function bootstrapBinaryErrorCode(errno: string | undefined) {
   if (errno === 'EACCES' || errno === 'EPERM') return 'agent-binary-not-executable';
   if (errno === 'ELOOP' || errno === 'ENOTDIR' || errno === 'EINVAL') {
     return 'agent-binary-resolve-failed';

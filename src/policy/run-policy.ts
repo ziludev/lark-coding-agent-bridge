@@ -86,6 +86,27 @@ export type RunPolicyResult = RunPolicyAllow | RunPolicyReject;
 
 const DEFAULT_TTL_MS = 5 * 60 * 1000;
 
+/**
+ * Per-profile agent home that isolates the CLI's own state (Codex home, pi
+ * agent dir). Both kinds reuse the fingerprint's `codexHome` slots so existing
+ * session catalogs keys stay stable.
+ */
+export function agentHomeFields(profileConfig: ProfileConfig): {
+  codexHome?: string;
+  inheritCodexHome?: boolean;
+} {
+  if (profileConfig.agentKind === 'pi') {
+    return {
+      ...(profileConfig.pi?.agentDir ? { codexHome: profileConfig.pi.agentDir } : {}),
+      inheritCodexHome: profileConfig.pi?.inheritAgentDir !== false,
+    };
+  }
+  return {
+    codexHome: profileConfig.codex?.codexHome,
+    inheritCodexHome: profileConfig.codex?.inheritCodexHome,
+  };
+}
+
 export function evaluateRunPolicy(input: RunPolicyInput): RunPolicyResult {
   if (!input.access.ok) {
     return reject('access-denied', '当前用户无权发起运行。');

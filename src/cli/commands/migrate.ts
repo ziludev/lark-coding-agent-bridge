@@ -1,6 +1,6 @@
 import { mkdir, readFile, readdir, rename, rm, stat } from 'node:fs/promises';
 import { dirname, join } from 'node:path';
-import { createBootstrapCodexConfig } from '../profile-bootstrap';
+import { createBootstrapCodexConfig, createBootstrapPiConfig } from '../profile-bootstrap';
 import { promptLine } from '../prompt';
 import { stopProcessEntry } from './ps';
 import {
@@ -43,13 +43,18 @@ export async function runMigrate(opts: MigrateOptions): Promise<void> {
   const configPath = opts.config ?? paths.configFile;
   await migrateLegacyPaths();
   await migrateConfigShape(configPath);
-  const agentKind = agentKindFromString(opts.agent) ?? (opts.profile === 'codex' ? 'codex' : undefined);
+  const agentKind =
+    agentKindFromString(opts.agent) ??
+    (opts.profile === 'codex' ? 'codex' : opts.profile === 'pi' ? 'pi' : undefined);
   const needsV2Migration = await hasLegacyProfileConfig(configPath);
   const result = await migrateProfileV2WithActiveBridgePrompt({
     rootDir: dirname(configPath),
     configFile: configPath,
     profile: opts.profile,
     ...(agentKind ? { agentKind } : {}),
+    ...(needsV2Migration && agentKind === 'pi'
+      ? { pi: await createBootstrapPiConfig(undefined) }
+      : {}),
     ...(needsV2Migration && agentKind === 'codex'
       ? { codex: await createBootstrapCodexConfig(undefined) }
       : {}),
