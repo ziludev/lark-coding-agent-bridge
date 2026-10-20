@@ -164,6 +164,35 @@ describe('profile store canonical serialization', () => {
     });
   });
 
+  it('persists the pi agent config across save→load round-trip', async () => {
+    const root = await tmpRoot();
+    const configPath = join(root, 'config.json');
+    const profile = createDefaultProfileConfig({
+      agentKind: 'pi',
+      accounts: { app },
+      pi: { binaryPath: '/usr/local/bin/pi', agentDir: '/state/pi-agent', inheritAgentDir: false },
+    });
+
+    await saveRootConfig({
+      schemaVersion: 2,
+      activeProfile: 'pi',
+      preferences: {},
+      profiles: { pi: profile },
+    }, configPath);
+
+    // On disk: the serializer must not strip the pi block, or reloading the
+    // profile fails schema validation ("pi profile requires pi configuration").
+    const saved = JSON.parse(await readFile(configPath, 'utf8'));
+    expect(saved.profiles.pi.pi).toMatchObject({ agentDir: '/state/pi-agent' });
+
+    const loaded = await loadRootConfig(configPath);
+    expect(loaded?.profiles.pi?.pi).toEqual({
+      binaryPath: '/usr/local/bin/pi',
+      agentDir: '/state/pi-agent',
+      inheritAgentDir: false,
+    });
+  });
+
   it('persists deployment mode across save→load round-trip', async () => {
     const root = await tmpRoot();
     const configPath = join(root, 'config.json');

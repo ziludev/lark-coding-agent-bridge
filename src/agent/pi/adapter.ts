@@ -18,6 +18,7 @@ import type {
 } from '../types';
 import { buildPiArgs } from './argv';
 import { PiJsonlTranslator, type PiTerminationReason } from './jsonl';
+import { createJsonlRecordReader } from './jsonl-stream';
 
 export interface PiAdapterOptions {
   binary: string;
@@ -224,6 +225,7 @@ async function* createEventStream(
     return;
   }
 
+  const reader = createJsonlRecordReader(child.stdout);
   let sawStdout = false;
   let silentExitTimer: ReturnType<typeof setTimeout> | undefined;
   const closeSilentStdout = (): void => {
@@ -233,7 +235,7 @@ async function* createEventStream(
   };
   child.once('exit', closeSilentStdout);
   try {
-    for await (const record of readJsonlRecords(child.stdout)) {
+    for await (const record of reader.records()) {
       sawStdout = true;
       yield* translator.translate(record);
     }
@@ -272,41 +274,6 @@ async function* createEventStream(
   // pi exits 0 even when a turn was aborted or the provider errored, and it
   // does not always emit `agent_settled` for those (e.g. SIGTERM mid-turn).
   yield* translator.finish(translator.sawAbortedTurn() ? 'interrupted' : 'normal');
-}
-
-/**
- * Split pi's JSONL stream on LF only. `node:readline` also splits on U+2028 and
- * U+2029, which are legal inside JSON strings, so a Chinese/CJK answer would be
- * cut mid-record; pi's docs call this out explicitly.
- */
-async function* readJsonlRecords(stream: Readable): AsyncGenerator<unknown> {
-  const decoder = new TextDecoder('utf-8');
-  let buffer = '';
-  for await (const chunk of stream as AsyncIterable<Buffer | string>) {
-    buffer += typeof chunk === 'string' ? chunk : decoder.decode(chunk, { stream: true });
-    let nl = buffer.indexOf('\n');
-    while (nl !== -1) {
-      const line = stripCr(buffer.slice(0, nl));
-      buffer = buffer.slice(nl + 1);
-      if (line.trim()) yield parseRecord(line);
-      nl = buffer.indexOf('\n');
-    }
-  }
-  const tail = stripCr(buffer + decoder.decode());
-  if (tail.trim()) yield parseRecord(tail);
-}
-
-function parseRecord(line: string): unknown {
-  try {
-    return JSON.parse(line);
-  } catch {
-    log.warn('jsonl', 'unparsable_record', { chars: line.length });
-    return undefined;
-  }
-}
-
-function stripCr(line: string): string {
-  return line.endsWith('\r') ? line.slice(0, -1) : line;
 }
 
 async function waitForExitCode(child: PiChild): Promise<number | null> {

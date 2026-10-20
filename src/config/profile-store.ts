@@ -97,6 +97,7 @@ function serializeProfileConfig(profile: ProfileConfig): StoredProfileConfig {
     workspaces: profile.workspaces,
     permissions: profile.permissions,
     ...(profile.codex ? { codex: profile.codex } : {}),
+    ...(profile.pi ? { pi: profile.pi } : {}),
     attachments: profile.attachments,
     comments: {},
     meeting: profile.meeting,

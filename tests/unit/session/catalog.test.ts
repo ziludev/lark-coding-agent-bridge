@@ -64,6 +64,39 @@ describe('agent-aware session catalog', () => {
     await catalog.flush();
   });
 
+  it('stores pi sessions by native session id, like Claude', async () => {
+    const catalog = new SessionCatalog(await path());
+
+    catalog.upsertActive({
+      scopeId: 'chat-1',
+      agentId: 'pi',
+      cwdRealpath: '/repo',
+      policyFingerprint: 'fp-1',
+      sessionId: 'pi-sess-1',
+      now: 1000,
+    });
+
+    expect(
+      catalog.activeFor({
+        scopeId: 'chat-1',
+        agentId: 'pi',
+        cwdRealpath: '/repo',
+        policyFingerprint: 'fp-1',
+      }),
+    ).toMatchObject({ sessionId: 'pi-sess-1', agentId: 'pi' });
+    expect(() =>
+      catalog.upsertActive({
+        scopeId: 'chat-1',
+        agentId: 'pi',
+        cwdRealpath: '/repo',
+        policyFingerprint: 'fp-1',
+        threadId: 'thread-wrong',
+        now: 1000,
+      }),
+    ).toThrow(/Pi.*sessionId/i);
+    await catalog.flush();
+  });
+
   it('rejects mismatched Claude/Codex identity fields and does not auto-resume damaged entries', async () => {
     const catalog = new SessionCatalog(await path());
 
