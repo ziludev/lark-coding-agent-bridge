@@ -18,7 +18,8 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
-import { renderCard } from '../card/run-renderer';
+import { formatElapsed } from '../card/progress-label';
+import { renderCard, type RunCardRenderOptions } from '../card/run-renderer';
 import {
   finalizeIfRunning,
   initialState,
@@ -77,6 +78,13 @@ import {
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
+/**
+ * Only runs this long deserve a completion notice. Shorter ones are almost
+ * certainly still being watched, so an extra message would just be noise.
+ */
+const COMPLETION_NOTICE_MIN_MS = 30_000;
+/** First line of the answer, trimmed into the completion notice. */
+const COMPLETION_NOTICE_SUMMARY_MAX = 60;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 /**
  * How often a running card re-renders while a tool is in flight, so the
@@ -832,6 +840,10 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
 
+  // Whole-run wall clock: reported by the completion notice, which only fires
+  // past COMPLETION_NOTICE_MIN_MS (see sendCompletionNotice).
+  const runStartedAt = Date.now();
+
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
 
@@ -1185,7 +1197,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex') throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
-      await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
+      const settledInPlace = await finalizeStreamedReply({
+        channel,
+        progress,
+        finalState: filterForPrefs(latestState),
+        mode: 'card',
+        scope,
+        cardRenderOptions,
+      });
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
           channel,
@@ -1195,6 +1214,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+        });
+      } else if (settledInPlace) {
+        await sendCompletionNotice({
+          channel,
+          chatId,
+          scope,
+          state: filterForPrefs(latestState),
+          sendOpts,
+          elapsedMs: Date.now() - runStartedAt,
         });
       }
     } else if (replyMode === 'markdown') {
@@ -1248,7 +1276,14 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
         if (controls.profileConfig.agentKind !== 'codex') throw err;
         log.fail('stream', err, { mode: replyMode, step: 'progress-stream' });
       }
-      await recallIfEmptyStreamedReply(channel, progress, filterForPrefs(latestState), scope);
+      const settledInPlace = await finalizeStreamedReply({
+        channel,
+        progress,
+        finalState: filterForPrefs(latestState),
+        mode: 'markdown',
+        scope,
+        cardRenderOptions,
+      });
       if (controls.profileConfig.agentKind === 'codex') {
         await sendFinalReply({
           channel,
@@ -1258,6 +1293,15 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           replyMode,
           sendOpts,
           cardRenderOptions,
+        });
+      } else if (settledInPlace) {
+        await sendCompletionNotice({
+          channel,
+          chatId,
+          scope,
+          state: filterForPrefs(latestState),
+          sendOpts,
+          elapsedMs: Date.now() - runStartedAt,
         });
       }
     } else {
@@ -1308,6 +1352,13 @@ interface LazyProgressStream {
    */
   abandoned(): boolean;
   abandon(): void;
+  /**
+   * True once the run stopped waiting for this stream (terminal grace expired).
+   * The stream is still in flight, so terminal work on it must stay off the
+   * run's critical path — otherwise the next queued message waits on it.
+   */
+  detached(): boolean;
+  detach(): void;
 }
 
 /**
@@ -1327,6 +1378,7 @@ function createLazyProgressStream(
 ): LazyProgressStream {
   let stream: Promise<unknown> | undefined;
   let givenUp = false;
+  let offPath = false;
   let settle!: (result: Promise<unknown>) => void;
   const settled = new Promise<unknown>((resolve, reject) => {
     settle = (result) => {
@@ -1346,6 +1398,10 @@ function createLazyProgressStream(
     abandon: () => {
       givenUp = true;
     },
+    detached: () => offPath,
+    detach: () => {
+      offPath = true;
+    },
   };
 }
 
@@ -1362,7 +1418,7 @@ function createLazyProgressStream(
  *
  * `state` must already be `filterForPrefs`-projected, and emptiness is measured
  * with `renderText` in both reply modes so it matches the rule
- * `recallIfEmptyStreamedReply` applies: a stream we open is one that survives.
+ * `finalizeStreamedReply` applies: a stream we open is one that survives.
  */
 function shouldOpenProgressStream(state: RunState): boolean {
   if (state.terminal !== 'running') return false;
@@ -1396,33 +1452,185 @@ function finalReplyState(progress: LazyProgressStream, state: RunState): RunStat
 }
 
 /**
- * Backstop for a progress stream that was opened on real content and still
- * ended up empty — e.g. `/config` hiding tool calls mid-run, which retroactively
- * empties a tool-only render. The SDK fills such a card with its "(no content)"
- * placeholder, so recall it instead of leaving noise in the chat.
+ * Settle what the streamed reply shows once the run is over.
+ *
+ * Two cases, driven by what the final render actually produced:
+ *
+ *  1. Empty render (e.g. `/config` hid tool calls mid-run, retroactively
+ *     emptying a tool-only reply): the SDK fills the card with its
+ *     "(no content)" placeholder, so recall it instead of leaving noise.
+ *  2. Non-empty render: re-apply the terminal frame with one plain card PATCH.
+ *     The SDK's own last frame is best-effort — a single failed element-content
+ *     patch makes it stop patching that card for the rest of the run
+ *     (`streamingFailed`) while still finalizing the card, so the reply stays
+ *     frozen on the pre-failure snapshot, usually a "正在输出…" line that never
+ *     goes away (seen 2026-10-20 22:08: a 30s axios timeout mid-run). One extra
+ *     PATCH per streamed reply buys a deterministic last frame.
  *
  * `finalState` must already be `filterForPrefs`-projected (what the user sees).
+ *
+ * Returns true when the answer landed as an in-place PATCH of an already-read
+ * message — the only case that needs `sendCompletionNotice` to restore unread.
  */
-async function recallIfEmptyStreamedReply(
-  channel: LarkChannel,
-  progress: LazyProgressStream,
-  finalState: RunState,
-  scope: string,
-): Promise<void> {
-  if (!progress.opened()) return;
-  // An abandoned stream renders nothing, so whatever message it eventually
-  // posts is empty by construction. It is still in flight (that is why we gave
-  // up on it), so clean up in the background instead of blocking the run on it.
-  if (progress.abandoned()) {
-    void progress.settled.then(
-      (result) => recallStreamedMessage(channel, result, scope),
-      () => {},
-    );
-    return;
+async function finalizeStreamedReply(input: {
+  channel: LarkChannel;
+  progress: LazyProgressStream;
+  finalState: RunState;
+  mode: 'card' | 'markdown';
+  scope: string;
+  cardRenderOptions: RunCardRenderOptions;
+}): Promise<boolean> {
+  const { progress } = input;
+  if (!progress.opened()) return false;
+  // A stream we already stopped waiting on (abandoned or past its grace window)
+  // is still in flight; finishing it in the background keeps the next queued
+  // message from waiting on a stream that may never settle.
+  const settled = settleStreamedReply(input);
+  if (progress.abandoned() || progress.detached()) {
+    void settled;
+    return false;
   }
-  if (renderText(finalState).trim() !== '') return;
-  const result = await progress.settled.catch(() => undefined);
-  await recallStreamedMessage(channel, result, scope);
+  return settled;
+}
+
+/**
+ * Recall the streamed message if it renders empty, otherwise re-apply its
+ * terminal frame. Returns true iff the terminal frame was PATCHed in place.
+ */
+async function settleStreamedReply(input: {
+  channel: LarkChannel;
+  progress: LazyProgressStream;
+  finalState: RunState;
+  mode: 'card' | 'markdown';
+  scope: string;
+  cardRenderOptions: RunCardRenderOptions;
+}): Promise<boolean> {
+  const { channel, progress, finalState, mode, scope } = input;
+  const streamResult = await progress.settled.catch(() => undefined);
+  const messageId = (streamResult as { messageId?: string } | undefined)?.messageId;
+  if (!messageId) return false;
+
+  // An abandoned stream rendered nothing by construction, and its content
+  // already went out as a normal reply — just drop the empty message.
+  const text = renderText(finalState);
+  if (progress.abandoned() || text.trim() === '') {
+    await recallStreamedMessage(channel, streamResult, scope);
+    return false;
+  }
+
+  const card =
+    mode === 'card' ? renderCard(finalState, input.cardRenderOptions) : markdownFrameCard(text);
+  try {
+    await channel.updateCard(messageId, card);
+    log.info('outbound', 'stream-final-frame', {
+      scope,
+      mode,
+      messageId,
+      terminal: finalState.terminal,
+      chars: text.length,
+    });
+    return true;
+  } catch (err) {
+    log.warn('outbound', 'stream-final-frame-failed', {
+      scope,
+      mode,
+      messageId,
+      err: err instanceof Error ? err.message : String(err),
+    });
+    return false;
+  }
+}
+
+/**
+ * Post a short "done" message after a run whose answer went out as an in-place
+ * PATCH of the streamed card/markdown message.
+ *
+ * Feishu only notifies on NEW messages: a PATCH that turns the streaming card
+ * into the final answer leaves the chat read, so a user who glanced at the
+ * reasoning mid-run gets no unread badge and no push when the run finishes.
+ * One extra short message restores it; the answer's first line rides along so
+ * the notification itself is useful.
+ */
+async function sendCompletionNotice(input: {
+  channel: LarkChannel;
+  chatId: string;
+  scope: string;
+  state: RunState;
+  sendOpts: { replyTo: string; replyInThread?: boolean };
+  elapsedMs: number;
+}): Promise<void> {
+  // Short runs are still being watched; a notice just adds noise.
+  if (input.elapsedMs < COMPLETION_NOTICE_MIN_MS) return;
+  const body = renderCompletionNotice(input.state, input.elapsedMs);
+  try {
+    const result = await input.channel.send(input.chatId, { markdown: body }, input.sendOpts);
+    log.info('outbound', 'completion-notice', {
+      scope: input.scope,
+      terminal: input.state.terminal,
+      elapsedMs: input.elapsedMs,
+      messageId: (result as { messageId?: string } | undefined)?.messageId,
+    });
+  } catch (err) {
+    log.warn('outbound', 'completion-notice-failed', {
+      scope: input.scope,
+      err: err instanceof Error ? err.message : String(err),
+    });
+  }
+}
+
+function renderCompletionNotice(state: RunState, elapsedMs: number): string {
+  const elapsed = formatElapsed(elapsedMs);
+  const head =
+    state.terminal === 'interrupted'
+      ? `⏹ 已中断 · ${elapsed}`
+      : state.terminal === 'idle_timeout'
+        ? `⏱ ${state.idleTimeoutMinutes ?? 0} 分钟无响应，已终止`
+        : state.terminal === 'error'
+          ? `⚠️ 运行失败 · ${elapsed}`
+          : `✅ 已完成 · ${elapsed}`;
+  const summary = completionSummary(state);
+  return summary ? `${head}\n\n> ${summary}` : head;
+}
+
+/**
+ * First line of the answer worth quoting in the notice. Derived from
+ * `renderText` so it shares the email masking the real reply needs.
+ */
+function completionSummary(state: RunState): string {
+  const line = renderText(state)
+    .split('\n')
+    // Tool lines and terminal notices start with `>` / `_`; the answer does not.
+    .find((candidate) => {
+      const trimmed = candidate.trim();
+      return trimmed !== '' && !trimmed.startsWith('>') && !trimmed.startsWith('_');
+    });
+  if (!line) return '';
+  const text = line
+    .replace(/^[#>*\-`\s]+/, '')
+    .replace(/\s+/g, ' ')
+    .replace(/[*_`]+$/, '')
+    .trim();
+  if (!text) return '';
+  return text.length > COMPLETION_NOTICE_SUMMARY_MAX
+    ? `${text.slice(0, COMPLETION_NOTICE_SUMMARY_MAX - 1)}…`
+    : text;
+}
+
+/**
+ * Terminal frame for a markdown reply: the same single-element card the SDK's
+ * markdown streamer finishes with, rebuilt locally so re-applying it looks
+ * exactly like the stream's own last frame (no panels, no typing cursor).
+ */
+function markdownFrameCard(markdown: string): object {
+  const preview = markdown.replace(/\s+/g, ' ').trim();
+  return {
+    schema: '2.0',
+    config: {
+      streaming_mode: false,
+      summary: { content: preview.length > 50 ? `${preview.slice(0, 49)}…` : preview },
+    },
+    body: { elements: [{ tag: 'markdown', element_id: 'stream_md', content: markdown }] },
+  };
 }
 
 async function recallStreamedMessage(
@@ -1764,6 +1972,9 @@ async function awaitRenderAwareStream(input: {
         mode: input.mode,
         graceMs: STREAM_TERMINAL_GRACE_MS,
       });
+      // Stop treating the stream as part of this run: it still has to squeeze
+      // out its final frame, but the flush must not wait on it.
+      input.progress.detach();
       void streamResult.then((result) => {
         if (!result.ok) {
           log.fail('stream', result.err, { mode: input.mode, step: 'stream-terminal-late' });

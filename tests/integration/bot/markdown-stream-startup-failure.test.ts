@@ -64,7 +64,9 @@ interface FakeLarkChannel {
   getChatMode(chatId: string): Promise<'group' | 'topic'>;
   getConnectionStatus(): { state: 'connected'; reconnectAttempts: number };
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
-  stream(chatId: string, input: unknown, options?: unknown): Promise<void>;
+  stream(chatId: string, input: unknown, options?: unknown): Promise<unknown>;
+  cardUpdates: Array<{ messageId: string; card: Record<string, unknown> }>;
+  updateCard(messageId: string, card: object): Promise<void>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
 }
@@ -326,6 +328,43 @@ describe('markdown stream startup failures', () => {
     expect(setContent).not.toHaveBeenCalled();
   }, 15_000);
 
+  it('re-applies the terminal frame when the stream ends on a stale snapshot', async () => {
+    // Regression: the SDK gives up patching a card after one failed element
+    // update (`streamingFailed`) but still finalizes it, so the reply can stay
+    // frozen on the last successful snapshot — typically a "正在输出…" footer.
+    const setContent = vi.fn(async () => {});
+    const h = await createHarness({
+      agentKind: 'claude',
+      events: [
+        { type: 'text', delta: 'STREAMED_BODY' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+      stream: async (_chatId, input) => {
+        const producer = (input as {
+          markdown?: (ctrl: { setContent(markdown: string): Promise<void> }) => Promise<void>;
+        }).markdown;
+        await producer?.({ setContent });
+        return { messageId: 'om_stream_frozen' };
+      },
+    });
+    await startTestBridge(h);
+
+    await h.channel.handlers.message?.(message('om_frozen', 'run'));
+    await waitFor(() => h.channel.cardUpdates.length === 1);
+
+    const update = h.channel.cardUpdates[0];
+    expect(update?.messageId).toBe('om_stream_frozen');
+    const card = update?.card as {
+      config: { streaming_mode: boolean };
+      body: { elements: Array<{ content?: string }> };
+    };
+    expect(card.config.streaming_mode).toBe(false);
+    expect(card.body.elements[0]?.content).toContain('STREAMED_BODY');
+    expect(card.body.elements[0]?.content).not.toContain('正在输出');
+    // The stream itself never landed the terminal frame in this scenario.
+    expect(setContent).toHaveBeenCalled();
+  }, 10_000);
+
   it('still sends the final reply when the progress stream fails at completion', async () => {
     const fail = vi.spyOn(log, 'fail').mockImplementation(() => {});
     const h = await createHarness({
@@ -531,6 +570,7 @@ function createFakeLarkChannel(harnessOptions: {
 } = {}): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
+  const cardUpdates: FakeLarkChannel['cardUpdates'] = [];
   const channel: FakeLarkChannel = {
     handlers,
     sent,
@@ -577,6 +617,10 @@ function createFakeLarkChannel(harnessOptions: {
     stream: harnessOptions.stream ?? (async () => {
       await new Promise<void>(() => {});
     }),
+    cardUpdates,
+    async updateCard(messageId, card) {
+      cardUpdates.push({ messageId, card: card as Record<string, unknown> });
+    },
     async addReaction(messageId, emojiType) {
       const r = await channel.rawClient.im.v1.messageReaction.create({
         path: { message_id: messageId },
