@@ -98,3 +98,13 @@ export function modelLabel(agentKind: AgentKind, value: string | undefined): str
   const normalized = normalizeModelSelection(agentKind, value);
   return supportedModels(agentKind).find((m) => m.value === normalized)?.label ?? normalized;
 }
+
+/**
+ * Footnote text for the model in play when the agent reports none of its own:
+ * the pinned picker label, or "默认" when the profile follows the agent
+ * default. Adapters that do report a model (Claude, pi) win over this — see
+ * `RunState.model`.
+ */
+export function pinnedModelText(agentKind: AgentKind, value: string | undefined): string {
+  return isDefaultModel(value) ? '默认' : modelLabel(agentKind, value);
+}

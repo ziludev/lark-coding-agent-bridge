@@ -2,6 +2,43 @@ import { describe, expect, it } from 'vitest';
 import { PiJsonlTranslator } from '../../../src/agent/pi/jsonl.js';
 
 describe('Pi JSONL translator', () => {
+  it('surfaces the resolved model once, from the assistant message that carries it', () => {
+    const t = new PiJsonlTranslator();
+    const message = (model: string) => ({
+      type: 'message_end',
+      message: { role: 'assistant', content: [], model, stopReason: 'stop' },
+    });
+
+    expect(t.translate(message('anthropic/claude-sonnet-4-6'))).toEqual([
+      { type: 'system', model: 'anthropic/claude-sonnet-4-6' },
+    ]);
+    // Same model on the next turn: no repeat event.
+    expect(t.translate(message('anthropic/claude-sonnet-4-6'))).toEqual([]);
+    // A switch is reported.
+    expect(t.translate(message('anthropic/claude-opus-4-8'))).toEqual([
+      { type: 'system', model: 'anthropic/claude-opus-4-8' },
+    ]);
+  });
+
+  it('reports the thinking level alongside the model, on change only', () => {
+    const t = new PiJsonlTranslator();
+    const message = (model: string, thinkingLevel?: string) => ({
+      type: 'message_end',
+      message: { role: 'assistant', content: [], model, thinkingLevel, stopReason: 'stop' },
+    });
+
+    expect(t.translate(message('deepseek-v4.1-flash', 'high'))).toEqual([
+      { type: 'system', model: 'deepseek-v4.1-flash', thinkingLevel: 'high' },
+    ]);
+    expect(t.translate(message('deepseek-v4.1-flash', 'high'))).toEqual([]);
+    // A thinking-level switch carries the still-current model with it.
+    expect(t.translate(message('deepseek-v4.1-flash', 'max'))).toEqual([
+      { type: 'system', model: 'deepseek-v4.1-flash', thinkingLevel: 'max' },
+    ]);
+    // No level on the message leaves the reported one untouched.
+    expect(t.translate(message('deepseek-v4.1-flash'))).toEqual([]);
+  });
+
   it('translates the session header, streamed text, tools, usage and settlement', () => {
     const t = new PiJsonlTranslator();
 

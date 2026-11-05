@@ -14,6 +14,11 @@ export type Block =
   | { kind: 'text'; content: string; streaming: boolean }
   | { kind: 'tool'; tool: ToolEntry };
 
+/** What the agent reported spending on this run (summed over its usage events). */
+export interface RunUsage {
+  costUsd?: number;
+}
+
 export type FooterStatus = 'thinking' | 'tool_running' | 'streaming' | null;
 export type Terminal = 'running' | 'done' | 'interrupted' | 'error' | 'idle_timeout';
 
@@ -27,6 +32,19 @@ export interface RunState {
   /** Set when terminal === 'idle_timeout' — how long claude was idle before
    * the watchdog gave up (so the message can say "N 分钟无响应"). */
   idleTimeoutMinutes?: number;
+  /**
+   * Model the agent reported actually loading (Claude's init event, pi's
+   * assistant message). Rendered as the reply's footnote; absent when the
+   * adapter exposes none, in which case the channel layer fills in the pinned
+   * picker label.
+   */
+  model?: string;
+  /** Effective thinking/reasoning level the agent ran with (pi reports it). */
+  thinkingLevel?: string;
+  /** Wall clock from run start to the terminal event, stamped on that state. */
+  elapsedMs?: number;
+  /** Spend reported by the agent; absent when the agent reports none (codex). */
+  usage?: RunUsage;
   /** Tool calls seen in this run, so a long tool loop shows visible progress.
    * Optional so externally-built RunState literals stay valid. */
   toolCalls?: number;
@@ -56,6 +74,16 @@ function closeStreamingText(blocks: Block[]): Block[] {
 
 export function reduce(state: RunState, evt: AgentEvent, opts: ReduceOptions = {}): RunState {
   switch (evt.type) {
+    case 'system': {
+      // The agent's own report of what it actually ran (model, thinking level)
+      // is the ground truth for the reply footnote; later events repeat it, so
+      // drop no-op updates.
+      const model = evt.model ?? state.model;
+      const thinkingLevel = evt.thinkingLevel ?? state.thinkingLevel;
+      if (model === state.model && thinkingLevel === state.thinkingLevel) return state;
+      return { ...state, model, thinkingLevel };
+    }
+
     case 'text': {
       const last = state.blocks[state.blocks.length - 1];
       if (last && last.kind === 'text' && last.streaming) {
@@ -73,6 +101,14 @@ export function reduce(state: RunState, evt: AgentEvent, opts: ReduceOptions = {
         reasoning: { ...state.reasoning, active: false },
         footer: 'streaming',
       };
+    }
+
+    case 'usage': {
+      if (evt.costUsd === undefined) return state;
+      // Agents report usage per turn (pi) or once with totals (claude); both
+      // accumulate, so a resumed multi-turn run shows the whole spend.
+      const costUsd = (state.usage?.costUsd ?? 0) + evt.costUsd;
+      return { ...state, usage: { ...state.usage, costUsd } };
     }
 
     case 'final_text':

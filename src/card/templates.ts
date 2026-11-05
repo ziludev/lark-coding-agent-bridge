@@ -68,6 +68,8 @@ export interface StatusInfo {
   emptySessionText?: string;
   sessionStale: boolean;
   agentName: string;
+  /** Model in play: reported by the agent, or the pinned picker label. */
+  model: string;
   runtimeAccess: {
     label: string;
     value: string;
@@ -104,6 +106,7 @@ export function statusCard(info: StatusInfo): object {
     `📁 **cwd**: ${cwdLine}`,
     `🔗 **session**: ${sessionLine}`,
     `🤖 **agent**: ${escapeMd(info.agentName)}`,
+    `🧠 **model**: ${escapeMd(info.model)}`,
     `🛡 **${escapeMd(info.runtimeAccess.label)}**: ${escapeMd(info.runtimeAccess.value)}`,
     ...(info.larkCliStatus ? [`🔐 **lark-cli**: ${info.larkCliStatus}`] : []),
     `🏃 **active run**: ${info.activeRun ? 'yes' : 'no'}`,

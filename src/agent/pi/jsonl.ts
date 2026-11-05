@@ -41,6 +41,9 @@ export interface PiProtocolDriftState {
  */
 export class PiJsonlTranslator {
   private sessionId: string | undefined;
+  /** Last model reported on an assistant message, to emit it only on change. */
+  private reportedModel: string | undefined;
+  private reportedThinkingLevel: string | undefined;
   private terminal = false;
   private lastStreamError: string | undefined;
   private lastAbortedTurn = false;
@@ -135,6 +138,26 @@ export class PiJsonlTranslator {
     if (message.role !== 'assistant') return [];
 
     const events: AgentEvent[] = [];
+    // pi stamps every assistant message with the model that produced it (and
+    // the thinking level it ran at), which is the only place the bridge can
+    // learn what a profile that follows pi's defaults actually used.
+    // `responseModel` is the provider's concrete answer when it differs from
+    // what was requested.
+    const model = stringValue(message.responseModel) ?? stringValue(message.model);
+    const thinkingLevel = stringValue(message.thinkingLevel);
+    const modelChanged = model !== undefined && model !== this.reportedModel;
+    const levelChanged =
+      thinkingLevel !== undefined && thinkingLevel !== this.reportedThinkingLevel;
+    if (modelChanged || levelChanged) {
+      if (modelChanged) this.reportedModel = model;
+      if (levelChanged) this.reportedThinkingLevel = thinkingLevel;
+      events.push({
+        type: 'system',
+        ...(this.reportedModel ? { model: this.reportedModel } : {}),
+        ...(this.reportedThinkingLevel ? { thinkingLevel: this.reportedThinkingLevel } : {}),
+      });
+    }
+
     const stopReason = stringValue(message.stopReason);
     if (stopReason === 'aborted' || stopReason === 'error') {
       this.lastAbortedTurn = true;

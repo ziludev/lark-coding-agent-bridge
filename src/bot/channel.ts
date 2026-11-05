@@ -6,7 +6,12 @@ import type {
 import { createLarkChannel } from '@larksuite/channel';
 import { dirname, join } from 'node:path';
 import { agentCapability } from '../agent/capability';
-import { modelLabel, normalizeModelSelection, resolveModelArg } from '../agent/models';
+import {
+  modelLabel,
+  normalizeModelSelection,
+  pinnedModelText,
+  resolveModelArg,
+} from '../agent/models';
 import {
   buildAgentPrompt,
   type BridgePromptInteractiveCard,
@@ -915,6 +920,8 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const modelPref = controls.profileConfig.preferences.model;
   const modelSelection = normalizeModelSelection(agentKind, modelPref);
   const requestedModel = resolveModelArg(agentKind, modelPref);
+  // Shown in the reply footnote when the agent reports no model of its own.
+  const pinnedModel = pinnedModelText(agentKind, modelPref);
   const prevModel = lastRunModelByScope.get(scope);
   const modelSwitched = prevModel !== undefined && prevModel !== modelSelection;
   lastRunModelByScope.set(scope, modelSelection);
@@ -1055,10 +1062,17 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
 
   // Re-read prefs on every flush so toggling /config mid-stream takes
   // effect immediately. Cheap object lookups, no allocation when on.
+  // The reply footnote needs *some* model name; agents that report their own
+  // (Claude, pi) already put it on the state, the rest fall back to the pin.
   const filterForPrefs = (state: RunState): RunState => {
-    if (getShowToolCalls(controls.cfg)) return state;
-    return { ...state, blocks: state.blocks.filter((b) => b.kind !== 'tool') };
+    const withModel: RunState = state.model ? state : { ...state, model: pinnedModel };
+    if (getShowToolCalls(controls.cfg)) return withModel;
+    return { ...withModel, blocks: withModel.blocks.filter((b) => b.kind !== 'tool') };
   };
+  // A run that only reported a model has no answer: every "is there anything
+  // to send" check below has to ignore the model footnote.
+  const hasAnswer = (state: RunState): boolean =>
+    renderText(state, { meta: false }).trim() !== '';
   const cardRenderOptions = callbackAuth
     ? {
         signCallback: (action: string) =>
@@ -1178,7 +1192,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            if (renderText(filterForPrefs(state)).trim() === '') return;
+            if (!hasAnswer(filterForPrefs(state))) return;
             await channel.send(
               chatId,
               { card: renderCard(filterForPrefs(state), cardRenderOptions) },
@@ -1260,7 +1274,7 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
             // Fallback goes out as a post message, whose `md` element cannot
             // render tables — flatten them to label/value lists.
             const body = renderText(filterForPrefs(state), { tables: 'list' });
-            if (body.trim()) {
+            if (hasAnswer(filterForPrefs(state))) {
               await channel.send(chatId, { markdown: body }, sendOpts);
             }
           },
@@ -1413,7 +1427,8 @@ function createLazyProgressStream(
  */
 function shouldOpenProgressStream(state: RunState): boolean {
   if (state.terminal !== 'running') return false;
-  return renderText({ ...state, footer: null }).trim() !== '';
+  // `model: false`: the footnote alone is not something to open a stream for.
+  return renderText({ ...state, footer: null }, { meta: false }).trim() !== '';
 }
 
 /**
@@ -1507,7 +1522,9 @@ async function settleStreamedReply(input: {
   // table becomes a native component), so build it once and reuse its text.
   const frame = mode === 'markdown' ? renderTextFrame(finalState) : undefined;
   const text = frame?.text ?? renderText(finalState);
-  if (progress.abandoned() || text.trim() === '') {
+  // The model footnote alone is not an answer.
+  const hasContent = renderText(finalState, { meta: false }).trim() !== '';
+  if (progress.abandoned() || !hasContent) {
     await recallStreamedMessage(channel, streamResult, scope);
     return false;
   }
@@ -1616,9 +1633,10 @@ async function sendFinalReply(input: {
   const body = renderText(input.state, { tables: 'list' });
 
   // Nothing deliverable to send (agent produced no text on a clean finish;
-  // error/interrupt/timeout keep `body` non-empty via their notices). Skip
-  // rather than post an empty card that renders as "(no content)".
-  if (!body.trim()) {
+  // error/interrupt/timeout keep `body` non-empty via their notices). The model
+  // footnote alone does not count. Skip rather than post an empty card that
+  // renders as "(no content)".
+  if (renderText(input.state, { meta: false }).trim() === '') {
     log.info('outbound', 'skip-empty', { scope: input.scope, mode: input.replyMode });
     return;
   }
@@ -1721,6 +1739,12 @@ async function processAgentStream(
   const runStart = Date.now();
   let state: RunState = initialState;
 
+  /** Freeze the wall clock onto the terminal state the user ends up seeing. */
+  const stampElapsed = (next: RunState): RunState =>
+    next.terminal === 'running' || next.elapsedMs !== undefined
+      ? next
+      : { ...next, elapsedMs: Date.now() - runStart };
+
   // Idle watchdog: claude going silent for `idleTimeoutMs` is treated as
   // "presumed hung", we stop() and surface a timeout marker on the card.
   //
@@ -1809,6 +1833,9 @@ async function processAgentStream(
 
       if (evt.type === 'system') {
         recordSession(evt);
+        // Still fold it into the run state: the model the agent reports in its
+        // init event is what the reply footnote shows.
+        state = reduce(state, evt);
         continue;
       }
       if (evt.type === 'usage') {
@@ -1822,13 +1849,15 @@ async function processAgentStream(
           if (costUsd !== undefined) reportMetric('cost_usd', costUsd);
           if (inputTokens !== undefined) reportMetric('tokens_in', inputTokens);
           if (outputTokens !== undefined) reportMetric('tokens_out', outputTokens);
+          // Fold the spend into the run state so the reply's footnote can show it.
+          state = reduce(state, evt);
         }
         continue;
       }
 
       const prevTerminal = state.terminal;
       const prevFooter = state.footer;
-      state = reduce(state, evt, { now: Date.now() });
+      state = stampElapsed(reduce(state, evt, { now: Date.now() }));
       if (state.footer !== prevFooter || state.terminal !== prevTerminal) {
         log.info('card', 'transition', { footer: state.footer, terminal: state.terminal });
       }
@@ -1856,6 +1885,7 @@ async function processAgentStream(
       state = finalizeIfRunning(state);
     }
   }
+  state = stampElapsed(state);
   log.info('card', 'final', { scope, terminal: state.terminal, interrupted: handle.interrupted });
   reportMetric('run_e2e_ms', Date.now() - runStart, { terminal: state.terminal });
   // Serialized with the ticker so a tick that was already in flight can never

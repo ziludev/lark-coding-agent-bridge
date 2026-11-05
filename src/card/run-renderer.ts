@@ -1,4 +1,5 @@
 import { MAX_NATIVE_TABLES_PER_CARD } from './markdown-table';
+import { runMetaText } from './run-meta';
 import { deepMaskEmails } from './mask-email';
 import { toolProgressSuffix } from './progress-label';
 import type { Block, RunState, ToolEntry } from './run-state';
@@ -55,6 +56,11 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
   } else if (state.terminal === 'done' && elements.length === 0) {
     elements.push(noteMd('_（未返回内容）_'));
   }
+
+  // How this answer was produced (model · elapsed · spend) — the footer-style
+  // spot, below the answer and the terminal notice, above the running status.
+  const meta = runMetaText(state);
+  if (meta) elements.push(noteMd(`🤖 ${meta}`));
 
   if (state.terminal === 'running') {
     if (state.footer) elements.push(footerStatus(state));

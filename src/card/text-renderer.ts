@@ -8,6 +8,7 @@ import {
 } from './markdown-table';
 import { deepMaskEmails, maskEmails } from './mask-email';
 import { toolProgressSuffix } from './progress-label';
+import { runMetaText } from './run-meta';
 import type { Block, RunState, ToolEntry } from './run-state';
 import { toolHeaderText } from './tool-render';
 
@@ -29,6 +30,12 @@ export interface RenderTextOptions {
    * comments. Default: `markdown`.
    */
   tables?: TableTextMode;
+  /**
+   * Append the `🤖 model · elapsed · cost` footnote. Default true; the
+   * emptiness checks pass false so a run that only produced that footnote still
+   * counts as "no content".
+   */
+  meta?: boolean;
 }
 
 /**
@@ -43,7 +50,9 @@ export interface RenderTextOptions {
  *   - Footer is appended inline at the bottom while running
  */
 export function renderText(state: RunState, options: RenderTextOptions = {}): string {
-  return maskEmails(renderMarkdown(renderParts(state), options.tables ?? 'markdown'));
+  return maskEmails(
+    renderMarkdown(renderParts(state, options.meta !== false), options.tables ?? 'markdown'),
+  );
 }
 
 /**
@@ -134,7 +143,7 @@ function renderMarkdown(parts: string[], tables: TableTextMode): string {
   return chunks.join('\n\n');
 }
 
-function renderParts(state: RunState): string[] {
+function renderParts(state: RunState, includeMeta = true): string[] {
   const parts = renderBlocks(state.blocks);
 
   if (state.terminal === 'interrupted') {
@@ -147,6 +156,10 @@ function renderParts(state: RunState): string[] {
   } else if (state.terminal === 'running' && state.footer) {
     parts.push(footerLine(state));
   }
+  // Model · elapsed · spend, as a small trailing line in both card and markdown
+  // modes. `_…_` keeps it out of completion summaries, which skip those lines.
+  const meta = includeMeta ? runMetaText(state) : '';
+  if (meta) parts.push(`_🤖 ${meta}_`);
   return parts;
 }
 

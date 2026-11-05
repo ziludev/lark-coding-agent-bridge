@@ -196,6 +196,31 @@ describe('completion reaction after an in-place reply', () => {
   });
 });
 
+describe('reply footnote', () => {
+  it('shows the model the agent reported, plus spend, instead of the pinned fallback', async () => {
+    vi.useFakeTimers();
+    const h = await createHarness({
+      messageReply: 'markdown',
+      holdMs: 0,
+      events: [
+        { type: 'system', sessionId: 'sess-1', model: 'claude-sonnet-4-6' },
+        { type: 'usage', costUsd: 0.0042 },
+        { type: 'text', delta: 'ANSWER' },
+        { type: 'done', terminationReason: 'normal' },
+      ],
+    });
+    await startTestBridge(h);
+
+    void h.channel.handlers.message?.(message('om_meta', 'run'));
+    await flushTimers(5_000);
+
+    const card = JSON.stringify(h.channel.cardUpdates.at(-1)?.card ?? {});
+    expect(card).toContain('claude-sonnet-4-6');
+    expect(card).toContain('$0.0042');
+    expect(card).not.toContain('默认');
+  });
+});
+
 interface Harness {
   tmp: TmpProfile;
   channel: FakeLarkChannel;

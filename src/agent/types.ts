@@ -4,7 +4,15 @@ import type { ClaudePermissionMode, CodexSandboxMode } from '../config/permissio
 export type { ClaudePermissionMode } from '../config/permissions';
 
 export type AgentEvent =
-  | { type: 'system'; sessionId?: string; threadId?: string; cwd?: string; model?: string }
+  | {
+      type: 'system';
+      sessionId?: string;
+      threadId?: string;
+      cwd?: string;
+      model?: string;
+      /** Effective reasoning/thinking level, for agents that report one (pi). */
+      thinkingLevel?: string;
+    }
   | { type: 'text'; delta: string }
   | { type: 'final_text'; content: string }
   | { type: 'thinking'; delta: string }
