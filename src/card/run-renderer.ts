@@ -1,6 +1,8 @@
+import { MAX_NATIVE_TABLES_PER_CARD } from './markdown-table';
 import { deepMaskEmails } from './mask-email';
 import { toolProgressSuffix } from './progress-label';
 import type { Block, RunState, ToolEntry } from './run-state';
+import { markdownToElements, type ElementBudget } from './text-renderer';
 import { toolBodyMd, toolHeaderText } from './tool-render';
 
 const REASONING_MAX = 1500;
@@ -22,6 +24,14 @@ export interface RunCardRenderOptions {
 
 export function renderCard(state: RunState, options: RunCardRenderOptions = {}): object {
   const elements: object[] = [];
+  // Tables picked up from the agent's text become native card components in the
+  // terminal card, capped because Feishu allows five per card. While the card is
+  // still streaming they stay markdown tables: `streaming_mode` cards are fed
+  // markdown only, and the reply is re-rendered once the run ends anyway.
+  const budget: ElementBudget = {
+    nativeTablesLeft: state.terminal === 'running' ? 0 : MAX_NATIVE_TABLES_PER_CARD,
+    fallback: 'markdown',
+  };
 
   if (state.reasoning.content) {
     elements.push(reasoningPanel(state.reasoning.content, state.reasoning.active));
@@ -29,9 +39,7 @@ export function renderCard(state: RunState, options: RunCardRenderOptions = {}):
 
   for (const group of groupBlocks(state.blocks)) {
     if (group.kind === 'text') {
-      if (group.content.trim()) {
-        elements.push(markdown(group.content));
-      }
+      elements.push(...markdownToElements(group.content, budget));
     } else {
       elements.push(...renderToolGroup(group.tools, state.terminal !== 'running'));
     }
@@ -171,10 +179,6 @@ function panelHeader(titleMd: string): object {
     icon_position: 'follow_text',
     icon_expanded_angle: -180,
   };
-}
-
-function markdown(content: string): object {
-  return { tag: 'markdown', content };
 }
 
 function noteMd(content: string): object {

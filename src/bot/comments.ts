@@ -4,6 +4,7 @@ import { dirname } from 'node:path';
 import type { CommentEvent, LarkChannel } from '@larksuite/channel';
 import { agentCapability, usesNativeSessionId } from '../agent/capability';
 import type { AgentAdapter, AgentEvent } from '../agent/types';
+import { splitTables, tableToKeyValueList } from '../card/markdown-table';
 import { getAgentStopGraceMs } from '../config/schema';
 import type { Controls } from '../commands';
 import { resolveAppPaths } from '../config/app-paths';
@@ -717,8 +718,22 @@ function isBridgeSelfReply(channel: LarkChannel, evt: CommentEvent): boolean {
  * Strip the most common markdown markers so a plain-text comment doesn't
  * show literal `**` / `#` / `> ` etc. Conservative — only touches bold,
  * italic, headings, blockquote, list bullets, and inline code.
+ *
+ * Pipe tables are flattened to label/value lines first: a drive comment only
+ * accepts text runs, so a raw table would arrive as a row of `|` characters.
  */
 export function stripMarkdown(s: string): string {
+  return stripInlineMarkers(stripTables(s));
+}
+
+function stripTables(s: string): string {
+  if (!s.includes('|')) return s;
+  return splitTables(s)
+    .map((segment) => (segment.kind === 'text' ? segment.content : tableToKeyValueList(segment.table)))
+    .join('\n');
+}
+
+function stripInlineMarkers(s: string): string {
   return s
     // headings: "# foo" -> "foo"
     .replace(/^#{1,6}\s+/gm, '')

@@ -28,7 +28,7 @@ import {
   reduce,
   type RunState,
 } from '../card/run-state';
-import { renderText } from '../card/text-renderer';
+import { renderText, renderTextFrame } from '../card/text-renderer';
 import { tryHandleCommand, type Controls } from '../commands';
 import type { AppConfig } from '../config/schema';
 import {
@@ -1266,7 +1266,9 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           producerStarted: () => producerStarted,
           fallback: async (state) => {
             if (controls.profileConfig.agentKind === 'codex') return;
-            const body = renderText(filterForPrefs(state));
+            // Fallback goes out as a post message, whose `md` element cannot
+            // render tables — flatten them to label/value lists.
+            const body = renderText(filterForPrefs(state), { tables: 'list' });
             if (body.trim()) {
               await channel.send(chatId, { markdown: body }, sendOpts);
             }
@@ -1512,14 +1514,16 @@ async function settleStreamedReply(input: {
 
   // An abandoned stream rendered nothing by construction, and its content
   // already went out as a normal reply — just drop the empty message.
-  const text = renderText(finalState);
+  // `markdown` mode needs the element-level frame anyway (it is the only way a
+  // table becomes a native component), so build it once and reuse its text.
+  const frame = mode === 'markdown' ? renderTextFrame(finalState) : undefined;
+  const text = frame?.text ?? renderText(finalState);
   if (progress.abandoned() || text.trim() === '') {
     await recallStreamedMessage(channel, streamResult, scope);
     return false;
   }
 
-  const card =
-    mode === 'card' ? renderCard(finalState, input.cardRenderOptions) : markdownFrameCard(text);
+  const card = frame ? markdownFrameCard(frame) : renderCard(finalState, input.cardRenderOptions);
   try {
     await channel.updateCard(messageId, card);
     log.info('outbound', 'stream-final-frame', {
@@ -1620,16 +1624,20 @@ function completionSummary(state: RunState): string {
  * Terminal frame for a markdown reply: the same single-element card the SDK's
  * markdown streamer finishes with, rebuilt locally so re-applying it looks
  * exactly like the stream's own last frame (no panels, no typing cursor).
+ *
+ * Unlike the stream (one markdown element, patched through CardKit) this frame
+ * is a full card replace, so it can carry native `table` components for every
+ * table the answer ended up with.
  */
-function markdownFrameCard(markdown: string): object {
-  const preview = markdown.replace(/\s+/g, ' ').trim();
+function markdownFrameCard(frame: { text: string; elements: object[] }): object {
+  const preview = frame.text.replace(/\s+/g, ' ').trim();
   return {
     schema: '2.0',
     config: {
       streaming_mode: false,
       summary: { content: preview.length > 50 ? `${preview.slice(0, 49)}…` : preview },
     },
-    body: { elements: [{ tag: 'markdown', element_id: 'stream_md', content: markdown }] },
+    body: { elements: frame.elements },
   };
 }
 
@@ -1661,7 +1669,9 @@ async function sendFinalReply(input: {
   sendOpts: { replyTo: string; replyInThread?: boolean };
   cardRenderOptions: { signCallback?: (action: string) => string };
 }): Promise<void> {
-  const body = renderText(input.state);
+  // Every branch below that sends `{ markdown }` ends up as a post message,
+  // whose `md` element cannot render tables — so they are flattened there.
+  const body = renderText(input.state, { tables: 'list' });
 
   // Nothing deliverable to send (agent produced no text on a clean finish;
   // error/interrupt/timeout keep `body` non-empty via their notices). Skip
