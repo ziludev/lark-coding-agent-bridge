@@ -18,7 +18,6 @@ import type { AgentAdapter, AgentEvent } from '../agent/types';
 import { handleCardAction } from '../card/dispatcher';
 import { CallbackAuth } from '../card/callback-auth';
 import { CallbackNonceStore } from '../card/callback-store';
-import { formatElapsed } from '../card/progress-label';
 import { renderCard, type RunCardRenderOptions } from '../card/run-renderer';
 import {
   finalizeIfRunning,
@@ -66,7 +65,12 @@ import { PendingQueue } from './pending-queue';
 import { ProcessPool } from './process-pool';
 import { fetchQuotedContext, fetchTopicContext, type QuotedContext } from './quote';
 import { lookupMessageThreadId } from './thread-id';
-import { addWorkingReaction, removeReaction } from './reaction';
+import {
+  addDoneReaction,
+  addFailedReaction,
+  addWorkingReaction,
+  removeReaction,
+} from './reaction';
 import { fetchKnownChats } from './lark-info';
 import type { AppPaths } from '../config/app-paths';
 import {
@@ -78,13 +82,6 @@ import {
 
 const DEBOUNCE_MS = 600;
 const STREAM_TERMINAL_GRACE_MS = 3000;
-/**
- * Only runs this long deserve a completion notice. Shorter ones are almost
- * certainly still being watched, so an extra message would just be noise.
- */
-const COMPLETION_NOTICE_MIN_MS = 30_000;
-/** First line of the answer, trimmed into the completion notice. */
-const COMPLETION_NOTICE_SUMMARY_MAX = 60;
 const REACTION_CLEANUP_GRACE_MS = 1000;
 /**
  * How often a running card re-renders while a tool is in flight, so the
@@ -840,10 +837,6 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
   const lastMsg = batch[batch.length - 1];
   if (!firstMsg || !lastMsg) return;
 
-  // Whole-run wall clock: reported by the completion notice, which only fires
-  // past COMPLETION_NOTICE_MIN_MS (see sendCompletionNotice).
-  const runStartedAt = Date.now();
-
   const chatId = firstMsg.chatId;
   const threadId = firstMsg.threadId;
 
@@ -1216,13 +1209,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           cardRenderOptions,
         });
       } else if (settledInPlace) {
-        await sendCompletionNotice({
+        await markRunComplete({
           channel,
-          chatId,
           scope,
+          messageId: lastMsg.messageId,
           state: filterForPrefs(latestState),
-          sendOpts,
-          elapsedMs: Date.now() - runStartedAt,
         });
       }
     } else if (replyMode === 'markdown') {
@@ -1297,13 +1288,11 @@ async function runAgentBatch(deps: RunBatchDeps): Promise<void> {
           cardRenderOptions,
         });
       } else if (settledInPlace) {
-        await sendCompletionNotice({
+        await markRunComplete({
           channel,
-          chatId,
           scope,
+          messageId: lastMsg.messageId,
           state: filterForPrefs(latestState),
-          sendOpts,
-          elapsedMs: Date.now() - runStartedAt,
         });
       }
     } else {
@@ -1472,7 +1461,7 @@ function finalReplyState(progress: LazyProgressStream, state: RunState): RunStat
  * `finalState` must already be `filterForPrefs`-projected (what the user sees).
  *
  * Returns true when the answer landed as an in-place PATCH of an already-read
- * message — the only case that needs `sendCompletionNotice` to restore unread.
+ * message — the case that then gets the `DONE` reaction (`markRunComplete`).
  */
 async function finalizeStreamedReply(input: {
   channel: LarkChannel;
@@ -1546,78 +1535,31 @@ async function settleStreamedReply(input: {
 }
 
 /**
- * Post a short "done" message after a run whose answer went out as an in-place
- * PATCH of the streamed card/markdown message.
+ * Mark the run finished on the message that triggered it.
  *
- * Feishu only notifies on NEW messages: a PATCH that turns the streaming card
- * into the final answer leaves the chat read, so a user who glanced at the
- * reasoning mid-run gets no unread badge and no push when the run finishes.
- * One extra short message restores it; the answer's first line rides along so
- * the notification itself is useful.
+ * Used when the answer landed as an in-place PATCH of the streamed reply: the
+ * chat itself does not move, so the completion cue is a reaction on the user's
+ * message — the same spot the "Typing" reaction occupied while the run was in
+ * flight: `DONE` for an answer, `ERROR` when the run ended without one. (A
+ * separate "已完成" message used to carry that signal, which added a chat
+ * message to every finished long run.)
  */
-async function sendCompletionNotice(input: {
+async function markRunComplete(input: {
   channel: LarkChannel;
-  chatId: string;
   scope: string;
+  messageId: string;
   state: RunState;
-  sendOpts: { replyTo: string; replyInThread?: boolean };
-  elapsedMs: number;
 }): Promise<void> {
-  // Short runs are still being watched; a notice just adds noise.
-  if (input.elapsedMs < COMPLETION_NOTICE_MIN_MS) return;
-  const body = renderCompletionNotice(input.state, input.elapsedMs);
-  try {
-    const result = await input.channel.send(input.chatId, { markdown: body }, input.sendOpts);
-    log.info('outbound', 'completion-notice', {
-      scope: input.scope,
-      terminal: input.state.terminal,
-      elapsedMs: input.elapsedMs,
-      messageId: (result as { messageId?: string } | undefined)?.messageId,
-    });
-  } catch (err) {
-    log.warn('outbound', 'completion-notice-failed', {
-      scope: input.scope,
-      err: err instanceof Error ? err.message : String(err),
-    });
-  }
-}
-
-function renderCompletionNotice(state: RunState, elapsedMs: number): string {
-  const elapsed = formatElapsed(elapsedMs);
-  const head =
-    state.terminal === 'interrupted'
-      ? `⏹ 已中断 · ${elapsed}`
-      : state.terminal === 'idle_timeout'
-        ? `⏱ ${state.idleTimeoutMinutes ?? 0} 分钟无响应，已终止`
-        : state.terminal === 'error'
-          ? `⚠️ 运行失败 · ${elapsed}`
-          : `✅ 已完成 · ${elapsed}`;
-  const summary = completionSummary(state);
-  return summary ? `${head}\n\n> ${summary}` : head;
-}
-
-/**
- * First line of the answer worth quoting in the notice. Derived from
- * `renderText` so it shares the email masking the real reply needs.
- */
-function completionSummary(state: RunState): string {
-  const line = renderText(state)
-    .split('\n')
-    // Tool lines and terminal notices start with `>` / `_`; the answer does not.
-    .find((candidate) => {
-      const trimmed = candidate.trim();
-      return trimmed !== '' && !trimmed.startsWith('>') && !trimmed.startsWith('_');
-    });
-  if (!line) return '';
-  const text = line
-    .replace(/^[#>*\-`\s]+/, '')
-    .replace(/\s+/g, ' ')
-    .replace(/[*_`]+$/, '')
-    .trim();
-  if (!text) return '';
-  return text.length > COMPLETION_NOTICE_SUMMARY_MAX
-    ? `${text.slice(0, COMPLETION_NOTICE_SUMMARY_MAX - 1)}…`
-    : text;
+  const succeeded = input.state.terminal === 'done';
+  const reactionId = succeeded
+    ? await addDoneReaction(input.channel, input.messageId)
+    : await addFailedReaction(input.channel, input.messageId);
+  log.info('outbound', 'run-complete', {
+    scope: input.scope,
+    messageId: input.messageId,
+    terminal: input.state.terminal,
+    reactionId,
+  });
 }
 
 /**

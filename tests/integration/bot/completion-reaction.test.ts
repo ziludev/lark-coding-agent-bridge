@@ -54,6 +54,7 @@ interface FakeLarkChannel {
   send(chatId: string, content: unknown, options?: unknown): Promise<{ messageId: string }>;
   stream(chatId: string, input: unknown, options?: unknown): Promise<unknown>;
   cardUpdates: Array<{ messageId: string; card: Record<string, unknown> }>;
+  reactions: Array<{ action: 'add' | 'remove'; messageId: string; emojiType?: string; reactionId?: string }>;
   updateCard(messageId: string, card: object): Promise<void>;
   addReaction(messageId: string, emojiType: string): Promise<string>;
   removeReaction(messageId: string, reactionId: string): Promise<void>;
@@ -104,8 +105,8 @@ class DelayedAdapter implements AgentAdapter {
   }
 }
 
-describe('completion notice after an in-place reply', () => {
-  it('posts a new message once a long streamed run finishes in markdown mode', async () => {
+describe('completion reaction after an in-place reply', () => {
+  it('marks a long streamed markdown reply with DONE instead of posting a message', async () => {
     vi.useFakeTimers();
     const h = await createHarness({
       messageReply: 'markdown',
@@ -120,16 +121,19 @@ describe('completion notice after an in-place reply', () => {
     void h.channel.handlers.message?.(message('om_long_md', 'run'));
     await flushTimers(40_000);
 
-    // The streamed message was patched in place; the notice is the only send.
+    // The streamed message was patched in place, so nothing is sent...
     expect(h.channel.cardUpdates).toHaveLength(1);
-    expect(h.channel.sent).toHaveLength(1);
-    const body = lastMarkdown(h.channel);
-    expect(body).toContain('已完成');
-    expect(body).toContain('ANSWER_HEAD_SENTINEL');
-    expect(h.channel.sent[0]?.options).toMatchObject({ replyTo: 'om_long_md' });
+    expect(h.channel.sent).toHaveLength(0);
+    // ...and the run is marked on the triggering message, where the typing cue was.
+    expect(h.channel.reactions.filter((r) => r.action === 'add')).toEqual([
+      { action: 'add', messageId: 'om_long_md', emojiType: 'Typing' },
+      { action: 'add', messageId: 'om_long_md', emojiType: 'DONE' },
+    ]);
+    // The typing cue is still cleaned up, leaving only DONE on the message.
+    expect(h.channel.reactions.filter((r) => r.action === 'remove')).toHaveLength(1);
   });
 
-  it('posts the notice in card mode too', async () => {
+  it('marks card mode the same way', async () => {
     vi.useFakeTimers();
     const h = await createHarness({
       messageReply: 'card',
@@ -145,11 +149,13 @@ describe('completion notice after an in-place reply', () => {
     await flushTimers(40_000);
 
     expect(h.channel.cardUpdates).toHaveLength(1);
-    expect(h.channel.sent).toHaveLength(1);
-    expect(lastMarkdown(h.channel)).toContain('已完成');
+    expect(h.channel.sent).toHaveLength(0);
+    expect(h.channel.reactions).toEqual([
+      { action: 'add', messageId: 'om_long_card', emojiType: 'DONE' },
+    ]);
   });
 
-  it('stays quiet on a short run, where the user is still watching', async () => {
+  it('marks a short run too, since the cue is not time-based', async () => {
     vi.useFakeTimers();
     const h = await createHarness({
       messageReply: 'markdown',
@@ -164,11 +170,11 @@ describe('completion notice after an in-place reply', () => {
     void h.channel.handlers.message?.(message('om_short', 'run'));
     await flushTimers(10_000);
 
-    expect(h.channel.cardUpdates).toHaveLength(1);
     expect(h.channel.sent).toHaveLength(0);
+    expect(h.channel.reactions.map((r) => r.emojiType).filter(Boolean)).toEqual(['Typing', 'DONE']);
   });
 
-  it('reports a failed long run instead of claiming success', async () => {
+  it('marks a run that ended without an answer as failed', async () => {
     vi.useFakeTimers();
     const h = await createHarness({
       messageReply: 'markdown',
@@ -183,10 +189,10 @@ describe('completion notice after an in-place reply', () => {
     void h.channel.handlers.message?.(message('om_failed', 'run'));
     await flushTimers(40_000);
 
-    expect(h.channel.sent).toHaveLength(1);
-    const body = lastMarkdown(h.channel);
-    expect(body).toContain('运行失败');
-    expect(body).not.toContain('✅');
+    expect(h.channel.sent).toHaveLength(0);
+    const added = h.channel.reactions.filter((r) => r.action === 'add').map((r) => r.emojiType);
+    expect(added).toContain('ERROR');
+    expect(added).not.toContain('DONE');
   });
 });
 
@@ -250,9 +256,11 @@ function createFakeLarkChannel(): FakeLarkChannel {
   const handlers: MessageHandlerMap = {};
   const sent: FakeLarkChannel['sent'] = [];
   const cardUpdates: FakeLarkChannel['cardUpdates'] = [];
+  const reactions: FakeLarkChannel['reactions'] = [];
   const channel: FakeLarkChannel = {
     handlers,
     sent,
+    reactions,
     botIdentity: { openId: 'ou_bot', name: 'Bridge' },
     rawClient: {
       request: vi.fn(async () => ({ data: { items: [] } })),
@@ -306,10 +314,13 @@ function createFakeLarkChannel(): FakeLarkChannel {
     async updateCard(messageId, card) {
       cardUpdates.push({ messageId, card: card as Record<string, unknown> });
     },
-    async addReaction() {
-      return 'reaction_1';
+    async addReaction(messageId, emojiType) {
+      reactions.push({ action: 'add', messageId, emojiType });
+      return `reaction_${reactions.length}`;
     },
-    async removeReaction() {},
+    async removeReaction(messageId, reactionId) {
+      reactions.push({ action: 'remove', messageId, reactionId });
+    },
   };
   return channel;
 }
